@@ -2,10 +2,10 @@ name: Build spam list
 
 on:
   schedule:
-    # Every 3 hours. The first day or so fills in the last 30 days in pieces,
+    # Hourly. The first day or so fills in the last 30 days in pieces,
     # because the FTC API allows a limited number of requests per hour.
     # After that, most runs find nothing new and finish in seconds.
-    - cron: "40 */3 * * *"
+    - cron: "40 * * * *"
   workflow_dispatch:
   push:
     paths:

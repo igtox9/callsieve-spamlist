@@ -10,7 +10,7 @@ is read from the FTC_API_KEY environment variable.
 Each run:
   1. Downloads any days in the last WINDOW_DAYS that are not yet in the local
      cache folder (newest first), staying inside the API's hourly rate limit.
-     A day that does not fit is picked up by a later run.
+     A day that does not fit is saved part-way and finished by a later run.
   2. Counts how many DIFFERENT people reported each number across the cache.
   3. Writes spamlist.txt with one "number,count" line per number that reaches
      MIN_REPORTS.
@@ -134,6 +134,38 @@ def read_day(path):
     return rows
 
 
+def part_path(cache_dir, day):
+    return os.path.join(cache_dir, f"{day.isoformat()}.part")
+
+
+def write_part(cache_dir, day, rows, offset):
+    """Save a day that is only partly downloaded, with where to resume."""
+    tmp = part_path(cache_dir, day) + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        f.write(f"#offset={offset}\n")
+        for number, who in rows:
+            f.write(f"{number}\t{who}\n")
+    os.replace(tmp, part_path(cache_dir, day))
+
+
+def read_part(cache_dir, day):
+    """Returns (rows, offset) for a partly downloaded day, or ([], 0)."""
+    path = part_path(cache_dir, day)
+    if not os.path.exists(path):
+        return [], 0
+    try:
+        with open(path, encoding="utf-8") as f:
+            first = f.readline().strip()
+        if not first.startswith("#offset="):
+            return [], 0
+        offset = int(first.split("=", 1)[1])
+        if offset < 0 or offset % PAGE_SIZE != 0:
+            return [], 0
+        return read_day(path), offset
+    except (OSError, ValueError):
+        return [], 0
+
+
 def prune_cache(cache_dir, oldest):
     for name in os.listdir(cache_dir):
         try:
@@ -152,6 +184,7 @@ class Api:
         self.reserve = reserve
         self.left = max_requests
         self.requests = 0
+        self.limit = None  # hourly allowance reported by the API
 
     def page(self, day, offset):
         if self.left <= 0:
@@ -171,6 +204,7 @@ class Api:
                 self.left -= 1
                 self.requests += 1
                 with urllib.request.urlopen(req, timeout=60) as resp:
+                    self.limit = resp.headers.get("X-RateLimit-Limit") or self.limit
                     remaining = resp.headers.get("X-RateLimit-Remaining")
                     if remaining is not None and remaining.isdigit():
                         self.left = min(self.left, int(remaining) - self.reserve)
@@ -190,16 +224,20 @@ class Api:
             time.sleep(3 * (attempt + 1))
         return []
 
-    def day(self, day):
-        """All usable rows for one day. Raises OutOfBudget if it cannot finish."""
-        rows, offset = [], 0
+    def day(self, day, progress):
+        """Download one day into progress = {"rows": [...], "offset": N}.
+
+        progress is updated after every page, so if OutOfBudget is raised the
+        caller can save it and a later run resumes from the same offset.
+        Returns the total number of reports seen for the day.
+        """
         for _ in range(MAX_PAGES_PER_DAY):
-            data = self.page(day, offset)
-            rows.extend(rows_from_records(data))
+            data = self.page(day, progress["offset"])
+            progress["rows"].extend(rows_from_records(data))
             if len(data) < PAGE_SIZE:
-                return rows, offset + len(data)
-            offset += PAGE_SIZE
-        return rows, offset
+                return progress["offset"] + len(data)
+            progress["offset"] += PAGE_SIZE
+        return progress["offset"]
 
 
 def main(out_path="spamlist.txt", cache_dir="daily"):
@@ -215,22 +253,36 @@ def main(out_path="spamlist.txt", cache_dir="daily"):
     prune_cache(cache_dir, oldest)
 
     api = Api(key)
+    day, progress = None, None
     try:
         # Yesterday backwards: today's reports are not complete yet.
         for back in range(1, WINDOW_DAYS + 1):
             day = today - dt.timedelta(days=back)
             if os.path.exists(cache_path(cache_dir, day)):
                 continue
-            rows, total = api.day(day)
+            rows, offset = read_part(cache_dir, day)
+            progress = {"rows": rows, "offset": offset}
+            if offset:
+                print(f"{day}: resuming at report {offset}")
+            total = api.day(day, progress)
             if total == 0 and back <= RECENT_DAYS:
                 print(f"{day}: nothing posted yet, will retry")
+                progress = None
                 continue
-            write_day(cache_dir, day, rows)
-            print(f"{day}: {total} reports, {len(rows)} usable")
+            write_day(cache_dir, day, progress["rows"])
+            if os.path.exists(part_path(cache_dir, day)):
+                os.remove(part_path(cache_dir, day))
+            print(f"{day}: {total} reports, {len(set(progress['rows']))} usable")
+            progress = None
     except OutOfBudget:
-        print(f"Hourly API allowance used after {api.requests} requests; "
-              "a later run will fetch the remaining days.")
+        if progress and progress["offset"]:
+            write_part(cache_dir, day, progress["rows"], progress["offset"])
+            print(f"{day}: saved part-way at report {progress['offset']}")
+        print(f"Hourly API allowance (limit {api.limit}) used after {api.requests} "
+              "requests; a later run will fetch the remaining days.")
     except Exception as e:  # keep what was fetched; publish from the cache
+        if progress and progress["offset"]:
+            write_part(cache_dir, day, progress["rows"], progress["offset"])
         print(f"Stopped early after {api.requests} requests: {e}", file=sys.stderr)
 
     files = sorted(n for n in os.listdir(cache_dir) if n.endswith(".tsv"))

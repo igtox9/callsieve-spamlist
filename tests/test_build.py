@@ -68,6 +68,39 @@ class BuildTest(unittest.TestCase):
             b.prune_cache(d, dt.date(2026, 10, 20))
             self.assertEqual(os.listdir(d), ["2026-11-17.tsv"])
 
+    def test_partial_day_is_resumed_and_finished(self):
+        day = dt.date(2026, 11, 17)
+        pages = {0: [rec(f"601483{3000 + i}", f"c{i}") for i in range(50)],
+                 50: [rec(f"601484{3000 + i}", f"c{i}") for i in range(50)],
+                 100: [rec("6014853000", "last")]}
+
+        class FakeApi(b.Api):
+            def __init__(self, budget):
+                super().__init__("k")
+                self.budget = budget
+            def page(self, d, offset):
+                if self.budget <= 0:
+                    raise b.OutOfBudget()
+                self.budget -= 1
+                return pages[offset]
+
+        with tempfile.TemporaryDirectory() as d:
+            progress = {"rows": [], "offset": 0}
+            with self.assertRaises(b.OutOfBudget):
+                FakeApi(2).day(day, progress)
+            self.assertEqual(progress["offset"], 100)
+            b.write_part(d, day, progress["rows"], progress["offset"])
+
+            rows, offset = b.read_part(d, day)
+            self.assertEqual((len(rows), offset), (100, 100))
+            progress = {"rows": rows, "offset": offset}
+            self.assertEqual(FakeApi(5).day(day, progress), 101)
+            self.assertEqual(len(progress["rows"]), 101)
+            # A damaged part file is ignored, never trusted.
+            open(b.part_path(d, day), "w").write("#offset=37\n")
+            self.assertEqual(b.read_part(d, day), ([], 0))
+            self.assertEqual(b.read_part(d, dt.date(2026, 1, 1)), ([], 0))
+
     def test_no_key_exits_cleanly(self):
         old = os.environ.pop("FTC_API_KEY", None)
         try:
