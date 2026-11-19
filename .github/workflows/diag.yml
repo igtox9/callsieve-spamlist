@@ -7,16 +7,11 @@ jobs:
   diag:
     runs-on: ubuntu-latest
     steps:
-      - name: Plain requests, default client identity
+      - name: API shape with a date filter
         run: |
-          U=https://www.ftc.gov/sites/default/files/DNC_Complaint_Numbers_2026-11-17.csv
-          echo "curl default:"; curl -sS -o /tmp/a.csv -w '%{http_code} %{size_download}\n' "$U" || true
-          head -c 300 /tmp/a.csv | head -5 || true
-          echo "python default:"; python3 -c "
-          import urllib.request,sys
-          try:
-              r=urllib.request.urlopen('$U',timeout=60); print(r.status, len(r.read()))
-          except Exception as e: print('ERR', e)
-          "
-          echo "api demo key:"; curl -sS -o /tmp/b.json -w '%{http_code} %{size_download}\n' "https://api.ftc.gov/v0/dnc-complaints?api_key=DEMO_KEY&items_per_page=2" || true
-          head -c 900 /tmp/b.json || true
+          curl -sS -D /tmp/h.txt -o /tmp/b.json -w 'HTTP %{http_code} %{size_download}\n' "https://api.ftc.gov/v0/dnc-complaints?api_key=DEMO_KEY&items_per_page=2&created_date=%222026-11-17%22" || true
+          echo "BODY:"; cat /tmp/b.json; echo
+          echo "HEADERS:"; grep -i -E "ratelimit|retry|content-type" /tmp/h.txt || true
+          curl -sS -o /tmp/c.json -w 'HTTP %{http_code}\n' "https://api.ftc.gov/v0/dnc-complaints?api_key=DEMO_KEY&items_per_page=50&offset=50&created_date=%222026-11-17%22&sort_order=ASC" || true
+          python3 -c "
+          import json; d=json.load(open('/tmp/c.json')); print('META', d.get('meta')); print('N', len(d.get('data',[]))); print('FIRST', d['data'][0]['attributes'] if d.get('data') else None)"
