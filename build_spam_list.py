@@ -252,6 +252,11 @@ class Api:
         for _ in range(MAX_PAGES_PER_DAY):
             data = self.page(day, progress["offset"])
             progress["rows"].extend(rows_from_records(data))
+            # Record IDs seen in this run, to spot the API repeating records
+            # across pages (which would also mean it is skipping others).
+            ids = progress.setdefault("ids", set())
+            progress["seen"] = progress.get("seen", 0) + len(data)
+            ids.update(r.get("id") for r in data if isinstance(r, dict))
             if len(data) < PAGE_SIZE:
                 return progress["offset"] + len(data)
             progress["offset"] += PAGE_SIZE
@@ -291,13 +296,15 @@ def main(out_path="spamlist.txt", cache_dir="daily"):
             if os.path.exists(part_path(cache_dir, day)):
                 os.remove(part_path(cache_dir, day))
             print(f"{day}: {total} reports, {len(progress['rows'])} with a valid number, "
-                  f"{len(set(progress['rows']))} distinct number+reporter pairs")
+                  f"{len(set(progress['rows']))} distinct number+reporter pairs; "
+                  f"this run saw {progress.get('seen', 0)} records with "
+                  f"{len(progress.get('ids', ()))} unique IDs")
             progress = None
     except OutOfBudget:
         if progress and progress["offset"]:
             write_part(cache_dir, day, progress["rows"], progress["offset"])
             print(f"{day}: saved part-way at report {progress['offset']}")
-        print(f"Hourly API allowance (limit {api.limit}) used after {api.requests} "
+        print(f"Hourly API allowance (limit {api.limit} records) used after {api.requests} "
               "requests; a later run will fetch the remaining days.")
     except Exception as e:  # keep what was fetched; publish from the cache
         if progress and progress["offset"]:
