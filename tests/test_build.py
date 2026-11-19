@@ -1,48 +1,82 @@
 import datetime as dt
-import os, sys, unittest
+import os, sys, tempfile, unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import build_spam_list as b
 
-HEADER = "Company_Phone_Number,Created_Date,Violation_Date,Consumer_City,Consumer_State,Consumer_Area_Code,Subject,Recorded_Message_Or_Robocall\n"
 
-def row(num, city, state="Texas", area="817"):
-    return f'{num},2026-11-16 00:08:24,2026-11-13 11:57:00,{city},{state},{area},"Calls pretending to be government, businesses, or family and friends",Y\n'
+def rec(num, city, state="Texas", area="817", seq=1):
+    return {"type": "dnc_complaint", "id": "x", "attributes": {
+        "company-phone-number": num, "created-date": "2026-11-17 14:52:41",
+        "violation-date": "2026-11-17 12:46:00", "consumer-city": city,
+        "consumer-state": state, "consumer-area-code": area,
+        "subject": "Other", "recorded-message-or-robocall": "Y", "seq": seq}}
+
+
+def data_lines(counts):
+    return [l for l in b.build_lines(counts, dt.date(2026, 11, 19), 20) if not l.startswith("#")]
+
 
 class BuildTest(unittest.TestCase):
     def test_clean_number(self):
         self.assertEqual(b.clean_number("6014833411"), "6014833411")
         self.assertEqual(b.clean_number("1-601-483-3411"), "6014833411")
+        self.assertEqual(b.clean_number(6014833411), "6014833411")
         self.assertIsNone(b.clean_number("12345"))
         self.assertIsNone(b.clean_number("0014833411"))   # bad area code
         self.assertIsNone(b.clean_number("6011833411"))   # bad exchange
         self.assertIsNone(b.clean_number("5555555555"))
+        self.assertIsNone(b.clean_number("06/10/2026"))   # seen in real API data
         self.assertIsNone(b.clean_number(""))
         self.assertIsNone(b.clean_number(None))
 
     def test_distinct_reporters_and_floor(self):
-        text = HEADER + row("6014833411", "Keller") + row("6014833411", "Keller") \
-            + row("6014833411", "Dallas") + row("6014833411", "Austin") \
-            + row("2282621203", "Keller") + row("2282621203", "Dallas")
-        reporters = {}
-        self.assertEqual(b.add_reports(text, reporters), 6)
-        # Same city reporting twice counts once.
-        self.assertEqual(len(reporters["6014833411"]), 3)
-        lines = b.build_lines(reporters, dt.date(2026, 11, 19), 20)
-        data = [l for l in lines if not l.startswith("#")]
-        self.assertEqual(data, ["6014833411,3"])  # 2 reporters is under the floor
+        rows = b.rows_from_records([
+            rec("6014833411", "Keller"), rec("6014833411", "Keller"),
+            rec("6014833411", "Dallas"), rec("6014833411", "Austin"),
+            rec("2282621203", "Keller"), rec("2282621203", "Dallas"),
+        ])
+        self.assertEqual(len(rows), 6)
+        counts = b.count_reporters([rows])
+        self.assertEqual(counts["6014833411"], 3)      # same city twice counts once
+        self.assertEqual(data_lines(counts), ["6014833411,3"])  # 2 is under the floor
 
     def test_counts_add_across_days_and_sort(self):
-        reporters = {}
-        b.add_reports(HEADER + "".join(row("8176238484", c) for c in "abcd"), reporters)
-        b.add_reports(HEADER + "".join(row("8176238484", c) for c in "cdef")
-                      + "".join(row("4692832023", c) for c in "abc"), reporters)
-        data = [l for l in b.build_lines(reporters, dt.date(2026, 11, 19), 20) if not l.startswith("#")]
-        self.assertEqual(data, ["8176238484,6", "4692832023,3"])
+        day1 = b.rows_from_records([rec("8176238484", c) for c in "abcd"])
+        day2 = b.rows_from_records([rec("8176238484", c) for c in "cdef"]
+                                   + [rec("4692832023", c) for c in "abc"])
+        self.assertEqual(data_lines(b.count_reporters([day1, day2])),
+                         ["8176238484,6", "4692832023,3"])
 
-    def test_quoted_commas_and_junk_rows(self):
-        text = HEADER + row("not a number", "Keller") + ",,,,,,,\n" + row("6014833411", "Keller")
-        reporters = {}
-        self.assertEqual(b.add_reports(text, reporters), 1)
+    def test_junk_records_are_skipped(self):
+        junk = [None, {}, {"attributes": None}, {"attributes": {"company-phone-number": "G"}},
+                rec("not a number", "Keller")]
+        self.assertEqual(b.rows_from_records(junk + [rec("6014833411", "Keller")]),
+                         [("6014833411", "keller|texas|817")])
+        self.assertEqual(b.rows_from_records(None), [])
+
+    def test_missing_location_counts_each_report(self):
+        rows = b.rows_from_records([rec("6014833411", "", "", "", seq=s) for s in (1, 2, 3)])
+        self.assertEqual(b.count_reporters([rows])["6014833411"], 3)
+
+    def test_cache_round_trip_and_prune(self):
+        with tempfile.TemporaryDirectory() as d:
+            day = dt.date(2026, 11, 17)
+            rows = b.rows_from_records([rec("6014833411", "Kel\tler"), rec("6014833411", "Dallas")])
+            b.write_day(d, day, rows)
+            b.write_day(d, dt.date(2026, 10, 1), [])
+            self.assertEqual(sorted(b.read_day(b.cache_path(d, day))), sorted(set(rows)))
+            b.prune_cache(d, dt.date(2026, 10, 20))
+            self.assertEqual(os.listdir(d), ["2026-11-17.tsv"])
+
+    def test_no_key_exits_cleanly(self):
+        old = os.environ.pop("FTC_API_KEY", None)
+        try:
+            self.assertEqual(b.main("unused.txt", "unused"), 2)
+            self.assertFalse(os.path.exists("unused.txt"))
+        finally:
+            if old is not None:
+                os.environ["FTC_API_KEY"] = old
+
 
 if __name__ == "__main__":
     unittest.main()

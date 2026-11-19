@@ -2,8 +2,10 @@ name: Build spam list
 
 on:
   schedule:
-    # Weekdays 17:40 UTC. The FTC usually posts each day's file by noon Eastern.
-    - cron: "40 17 * * 1-5"
+    # Every 3 hours. The first day or so fills in the last 30 days in pieces,
+    # because the FTC API allows a limited number of requests per hour.
+    # After that, most runs find nothing new and finish in seconds.
+    - cron: "40 */3 * * *"
   workflow_dispatch:
   push:
     paths:
@@ -20,6 +22,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -27,10 +30,25 @@ jobs:
           python-version: "3.12"
       - name: Tests
         run: python -m unittest discover -s tests -v
+      - name: Restore downloaded days
+        uses: actions/cache/restore@v4
+        with:
+          path: daily
+          key: daily-${{ github.run_id }}
+          restore-keys: daily-
       - name: Build list from FTC data
-        run: python build_spam_list.py spamlist.txt
+        env:
+          FTC_API_KEY: ${{ secrets.FTC_API_KEY }}
+        run: python build_spam_list.py spamlist.txt daily
+      - name: Save downloaded days
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: daily
+          key: daily-${{ github.run_id }}
       - name: Publish if changed
         run: |
+          if [ ! -f spamlist.txt ]; then echo "No list yet."; exit 0; fi
           head -3 spamlist.txt
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
