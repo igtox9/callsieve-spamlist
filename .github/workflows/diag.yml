@@ -1,0 +1,22 @@
+name: Diagnose FTC access
+on:
+  workflow_dispatch:
+  push:
+    paths: [".github/workflows/diag.yml"]
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Plain requests, default client identity
+        run: |
+          U=https://www.ftc.gov/sites/default/files/DNC_Complaint_Numbers_2026-11-17.csv
+          echo "curl default:"; curl -sS -o /tmp/a.csv -w '%{http_code} %{size_download}\n' "$U" || true
+          head -c 300 /tmp/a.csv | head -5 || true
+          echo "python default:"; python3 -c "
+          import urllib.request,sys
+          try:
+              r=urllib.request.urlopen('$U',timeout=60); print(r.status, len(r.read()))
+          except Exception as e: print('ERR', e)
+          "
+          echo "api demo key:"; curl -sS -o /tmp/b.json -w '%{http_code} %{size_download}\n' "https://api.ftc.gov/v0/dnc-complaints?api_key=DEMO_KEY&items_per_page=2" || true
+          head -c 900 /tmp/b.json || true
