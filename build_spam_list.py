@@ -179,12 +179,15 @@ def prune_cache(cache_dir, oldest):
 # ------------------------------------------------------------------- API calls
 
 class Api:
-    def __init__(self, key, reserve=5, max_requests=950):
+    def __init__(self, key, reserve=5, max_requests=2500):
         self.key = key
         self.reserve = reserve
         self.left = max_requests
         self.requests = 0
         self.limit = None  # hourly allowance reported by the API
+        self.wait_left = 20 * 60  # seconds this run may spend waiting on 429s
+        self.noted_429 = False
+        self.sleep = time.sleep
 
     def page(self, day, offset):
         if self.left <= 0:
@@ -199,7 +202,7 @@ class Api:
             f"{API}?{query}",
             headers={"X-Api-Key": self.key, "User-Agent": USER_AGENT},
         )
-        for attempt in range(3):
+        for attempt in range(40):
             try:
                 self.left -= 1
                 self.requests += 1
@@ -213,16 +216,31 @@ class Api:
                     return data if isinstance(data, list) else []
             except urllib.error.HTTPError as e:
                 if e.code == 429:
-                    raise OutOfBudget()
+                    # The API asks callers to slow down. Wait as long as it
+                    # says (within reason) and try again; give up for this
+                    # run once the waiting allowance is spent.
+                    wait = e.headers.get("Retry-After") if e.headers else None
+                    wait = int(wait) if wait and wait.isdigit() else 60
+                    if not self.noted_429:
+                        self.noted_429 = True
+                        print(f"Rate limited after {self.requests} requests "
+                              f"(Retry-After={e.headers.get('Retry-After') if e.headers else None}, "
+                              f"limit={e.headers.get('X-RateLimit-Limit') if e.headers else None}, "
+                              f"remaining={e.headers.get('X-RateLimit-Remaining') if e.headers else None})")
+                    if wait > 300 or self.wait_left < wait:
+                        raise OutOfBudget()
+                    self.wait_left -= wait
+                    self.sleep(wait)
+                    continue
                 if e.code == 403:
                     raise SystemExit("The FTC API rejected the key (HTTP 403). Check FTC_API_KEY.")
-                if attempt == 2:
+                if attempt >= 2:
                     raise
             except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
-                if attempt == 2:
+                if attempt >= 2:
                     raise
             time.sleep(3 * (attempt + 1))
-        return []
+        raise OutOfBudget()
 
     def day(self, day, progress):
         """Download one day into progress = {"rows": [...], "offset": N}.
@@ -272,7 +290,8 @@ def main(out_path="spamlist.txt", cache_dir="daily"):
             write_day(cache_dir, day, progress["rows"])
             if os.path.exists(part_path(cache_dir, day)):
                 os.remove(part_path(cache_dir, day))
-            print(f"{day}: {total} reports, {len(set(progress['rows']))} usable")
+            print(f"{day}: {total} reports, {len(progress['rows'])} with a valid number, "
+                  f"{len(set(progress['rows']))} distinct number+reporter pairs")
             progress = None
     except OutOfBudget:
         if progress and progress["offset"]:
