@@ -57,5 +57,7 @@ jobs:
             echo "No change."
           else
             git commit -m "Update spam list $(date -u +%F)"
+            # Someone may have pushed while this job ran; replay on top of it.
+            git pull --rebase origin main
             git push
           fi
