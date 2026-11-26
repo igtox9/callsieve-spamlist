@@ -7,17 +7,28 @@ https://www.ftc.gov/developer/api/v0/endpoints/do-not-call-dnc-reported-calls-da
 supported route.) A free key from https://api.data.gov/signup is required and
 is read from the FTC_API_KEY environment variable.
 
+The FTC posts one day of reports each weekday, and spam callers change
+numbers within days, so the list is built from only the WINDOW_DAYS most
+recent days that have reports. (Days, not calendar dates: nothing is posted
+at weekends, and a plain "last 3 dates" would be nearly empty every Monday.)
+
 Each run:
-  1. Downloads any days in the last WINDOW_DAYS that are not yet in the local
-     cache folder (newest first), staying inside the API's hourly rate limit.
-     A day that does not fit is saved part-way and finished by a later run.
-  2. Counts how many DIFFERENT people reported each number across the cache.
-  3. Writes spamlist.txt with one "number,count" line per number that reaches
-     MIN_REPORTS.
+  1. Downloads recent days that are not yet in the local cache folder (newest
+     first) until WINDOW_DAYS days with reports are cached, staying inside the
+     API's hourly rate limit. A day that does not fit is saved part-way and
+     finished by a later run.
+  2. Counts how many DIFFERENT people reported each number in those days and
+     writes one "number,count" line per number that reaches MIN_REPORTS.
+  3. Looks for number blocks: groups of numbers sharing their first six
+     digits (area code + exchange) where many different numbers were
+     reported. Callers who rotate numbers stay under MIN_REPORTS on each
+     one, but the block as a whole stands out. Each is written as a
+     "prefix*,distinct_numbers" line.
 
 The FTC states that none of the reports are verified, and callers often fake
 their number, so a single report means little. That is why the list only
-includes numbers reported from several different places.
+includes numbers reported from several different places, and blocks where
+several numbers were reported from several different places.
 
 Uses only the Python standard library.
 """
@@ -30,9 +41,13 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-WINDOW_DAYS = 30
-MIN_REPORTS = 3        # floor: fewer distinct reporters than this is never published
-MIN_DAYS_TO_PUBLISH = 5
+WINDOW_DAYS = 3         # most recent days WITH reports that make up the list
+LOOKBACK_DAYS = 10      # how far back to look for those days (weekends, holidays)
+MIN_REPORTS = 3         # floor: fewer distinct reporters than this is never published
+MIN_DAYS_TO_PUBLISH = WINDOW_DAYS
+PREFIX_LENGTH = 6       # area code + exchange
+PREFIX_MIN_NUMBERS = 5      # different numbers reported in one block...
+PREFIX_MIN_REPORTERS = 8    # ...by at least this many different people
 PAGE_SIZE = 50         # the API's maximum
 MAX_PAGES_PER_DAY = 2000
 RECENT_DAYS = 4        # an empty recent day may simply not be posted yet
@@ -97,16 +112,37 @@ def count_reporters(day_rows):
     return {n: len(r) for n, r in reporters.items()}
 
 
-def build_lines(counts, today, days_used, min_reports=MIN_REPORTS):
+def count_prefixes(day_rows, length=PREFIX_LENGTH):
+    """Returns {prefix: (distinct_numbers, distinct_reporters)} for number blocks."""
+    numbers, reporters = {}, {}
+    for rows in day_rows:
+        for number, who in rows:
+            prefix = number[:length]
+            numbers.setdefault(prefix, set()).add(number)
+            reporters.setdefault(prefix, set()).add(who)
+    return {p: (len(numbers[p]), len(reporters[p])) for p in numbers}
+
+
+def hot_prefixes(prefix_counts, min_numbers=PREFIX_MIN_NUMBERS, min_reporters=PREFIX_MIN_REPORTERS):
+    """The blocks worth publishing: {prefix: distinct_numbers}."""
+    return {p: n for p, (n, r) in prefix_counts.items() if n >= min_numbers and r >= min_reporters}
+
+
+def build_lines(counts, today, days_used, min_reports=MIN_REPORTS, prefixes=None):
     kept = {n: c for n, c in counts.items() if c >= min_reports}
+    prefixes = prefixes or {}
     lines = [
-        "# CallSieve known-spam list, format 1: number,distinct_reports",
+        "# CallSieve known-spam list, format 2: number,distinct_reports "
+        "and prefix*,distinct_numbers",
         "# Source: FTC Do Not Call Reported Calls Data (public, unverified reports)",
         f"# generated={today.isoformat()} window_days={WINDOW_DAYS} days_used={days_used} "
-        f"min_reports={min_reports} numbers={len(kept)}",
+        f"min_reports={min_reports} numbers={len(kept)} prefixes={len(prefixes)}",
     ]
     for number in sorted(kept, key=lambda n: (-kept[n], n)):
         lines.append(f"{number},{kept[number]}")
+    # Blocks come last. Apps older than format 2 skip these lines.
+    for prefix in sorted(prefixes, key=lambda p: (-prefixes[p], p)):
+        lines.append(f"{prefix}*,{prefixes[prefix]}")
     return lines
 
 
@@ -272,16 +308,22 @@ def main(out_path="spamlist.txt", cache_dir="daily"):
 
     os.makedirs(cache_dir, exist_ok=True)
     today = dt.datetime.now(dt.timezone.utc).date()
-    oldest = today - dt.timedelta(days=WINDOW_DAYS)
+    oldest = today - dt.timedelta(days=LOOKBACK_DAYS)
     prune_cache(cache_dir, oldest)
 
     api = Api(key)
     day, progress = None, None
     try:
-        # Yesterday backwards: today's reports are not complete yet.
-        for back in range(1, WINDOW_DAYS + 1):
+        # Yesterday backwards: today's reports are not complete yet. Stop as
+        # soon as the newest WINDOW_DAYS days with reports are in the cache.
+        with_reports = 0
+        for back in range(1, LOOKBACK_DAYS + 1):
+            if with_reports >= WINDOW_DAYS:
+                break
             day = today - dt.timedelta(days=back)
             if os.path.exists(cache_path(cache_dir, day)):
+                if os.path.getsize(cache_path(cache_dir, day)) > 0:
+                    with_reports += 1
                 continue
             rows, offset = read_part(cache_dir, day)
             progress = {"rows": rows, "offset": offset}
@@ -295,6 +337,8 @@ def main(out_path="spamlist.txt", cache_dir="daily"):
             write_day(cache_dir, day, progress["rows"])
             if os.path.exists(part_path(cache_dir, day)):
                 os.remove(part_path(cache_dir, day))
+            if progress["rows"]:
+                with_reports += 1
             print(f"{day}: {total} reports, {len(progress['rows'])} with a valid number, "
                   f"{len(set(progress['rows']))} distinct number+reporter pairs; "
                   f"this run saw {progress.get('seen', 0)} records with "
@@ -313,16 +357,48 @@ def main(out_path="spamlist.txt", cache_dir="daily"):
 
     files = sorted(n for n in os.listdir(cache_dir) if n.endswith(".tsv"))
     non_empty = [n for n in files if os.path.getsize(os.path.join(cache_dir, n)) > 0]
-    print(f"Cache holds {len(files)} days ({len(non_empty)} with reports).")
-    if len(non_empty) < MIN_DAYS_TO_PUBLISH:
-        print(f"Fewer than {MIN_DAYS_TO_PUBLISH} days cached; not writing a list yet.")
+    used = window_files(files, non_empty)
+    print(f"Cache holds {len(files)} days ({len(non_empty)} with reports); "
+          f"using {', '.join(n[:-4] for n in used) or 'none'}.")
+    if len(used) < MIN_DAYS_TO_PUBLISH:
+        print(f"Fewer than {MIN_DAYS_TO_PUBLISH} days with reports cached; not writing a list yet.")
         return 0
-    counts = count_reporters(read_day(os.path.join(cache_dir, n)) for n in files)
-    lines = build_lines(counts, today, len(non_empty))
+    days = [read_day(os.path.join(cache_dir, n)) for n in used]
+    counts = count_reporters(days)
+    prefix_counts = count_prefixes(days)
+    prefixes = hot_prefixes(prefix_counts)
+    lines = build_lines(counts, today, len(used), prefixes=prefixes)
     with open(out_path, "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(lines) + "\n")
-    print(f"Wrote {len(lines) - 3} numbers to {out_path}")
+    print(f"Wrote {len(lines) - 3 - len(prefixes)} numbers and {len(prefixes)} number blocks to {out_path}")
+    print_block_stats(counts, prefix_counts)
     return 0
+
+
+def window_files(files, non_empty):
+    """The newest WINDOW_DAYS cached days that have reports (file names sort by date)."""
+    return sorted(non_empty)[-WINDOW_DAYS:]
+
+
+def print_block_stats(counts, prefix_counts):
+    """Numbers for the build log, to judge whether the thresholds are sensible."""
+    for floor in (1, 2, 3, 5, 10):
+        print(f"numbers with {floor}+ reporters: {sum(1 for c in counts.values() if c >= floor)}")
+    for n in (3, 5, 8, 10, 20):
+        for r in (5, 8, 15):
+            hits = sum(1 for (a, b) in prefix_counts.values() if a >= n and b >= r)
+            print(f"blocks with {n}+ numbers and {r}+ reporters: {hits}")
+    top = sorted(prefix_counts.items(), key=lambda kv: (-kv[1][0], kv[0]))[:25]
+    print("top blocks (prefix numbers reporters): " + "; ".join(f"{p} {a} {b}" for p, (a, b) in top))
+    area = count_area(prefix_counts)
+    print("top area codes (code numbers): " + "; ".join(f"{a} {n}" for a, n in area[:25]))
+
+
+def count_area(prefix_counts):
+    totals = {}
+    for prefix, (numbers, _) in prefix_counts.items():
+        totals[prefix[:3]] = totals.get(prefix[:3], 0) + numbers
+    return sorted(totals.items(), key=lambda kv: (-kv[1], kv[0]))
 
 
 if __name__ == "__main__":

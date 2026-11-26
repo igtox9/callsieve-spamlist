@@ -47,6 +47,33 @@ class BuildTest(unittest.TestCase):
         self.assertEqual(data_lines(b.count_reporters([day1, day2])),
                          ["8176238484,6", "4692832023,3"])
 
+    def test_number_blocks_need_several_numbers_and_reporters(self):
+        hot = [rec(f"84455512{i:02d}", f"city{i}") for i in range(8)]      # 8 numbers, 8 reporters
+        one_reporter = [rec(f"84466612{i:02d}", "Keller") for i in range(8)]  # 8 numbers, 1 reporter
+        one_number = [rec("8447771200", f"city{i}") for i in range(8)]     # 1 number, 8 reporters
+        rows = b.rows_from_records(hot + one_reporter + one_number)
+        counts = b.count_prefixes([rows])
+        self.assertEqual(counts["844555"], (8, 8))
+        self.assertEqual(counts["844666"], (8, 1))
+        self.assertEqual(counts["844777"], (1, 8))
+        self.assertEqual(b.hot_prefixes(counts), {"844555": 8})
+
+    def test_blocks_are_written_after_numbers_in_format_2(self):
+        lines = b.build_lines({"8447771200": 8, "6014833411": 2}, dt.date(2026, 11, 26), 3,
+                              prefixes={"844555": 8, "212555": 12})
+        self.assertIn("format 2", lines[0])
+        self.assertIn("window_days=3", lines[2])
+        self.assertIn("numbers=1 prefixes=2", lines[2])
+        self.assertEqual(lines[3:], ["8447771200,8", "212555*,12", "844555*,8"])
+
+    def test_window_is_the_newest_days_with_reports(self):
+        files = [f"2026-11-{d}.tsv" for d in (18, 19, 20, 21, 22, 23, 24, 25)]
+        non_empty = [f for f in files if f[8:10] not in ("21", "22")]  # a weekend
+        self.assertEqual(b.window_files(files, non_empty),
+                         ["2026-11-23.tsv", "2026-11-24.tsv", "2026-11-25.tsv"])
+        self.assertEqual(b.window_files(files[:5], non_empty[:3]),
+                         ["2026-11-18.tsv", "2026-11-19.tsv", "2026-11-20.tsv"])
+
     def test_junk_records_are_skipped(self):
         junk = [None, {}, {"attributes": None}, {"attributes": {"company-phone-number": "G"}},
                 rec("not a number", "Keller")]
