@@ -2,9 +2,9 @@ name: Build spam list
 
 on:
   schedule:
-    # Hourly. The first day or so fills in the last 30 days in pieces,
-    # because the FTC API allows a limited number of requests per hour.
-    # After that, most runs find nothing new and finish in seconds.
+    # Hourly. Most runs find nothing new and finish in seconds. A new day
+    # of reports can take more than one run, because the FTC API allows a
+    # limited number of requests per hour.
     - cron: "40 * * * *"
   workflow_dispatch:
   push:
@@ -47,6 +47,8 @@ jobs:
           path: daily
           key: daily-${{ github.run_id }}
       - name: Publish if changed
+        # Only main publishes. A run on another branch is a trial build.
+        if: github.ref == 'refs/heads/main'
         run: |
           if [ ! -f spamlist.txt ]; then echo "No list yet."; exit 0; fi
           head -3 spamlist.txt

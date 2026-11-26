@@ -50,7 +50,7 @@ PREFIX_MIN_NUMBERS = 5      # different numbers reported in one block...
 PREFIX_MIN_REPORTERS = 8    # ...by at least this many different people
 PAGE_SIZE = 50         # the API's maximum
 MAX_PAGES_PER_DAY = 2000
-RECENT_DAYS = 4        # an empty recent day may simply not be posted yet
+RECENT_DAYS = 7        # an empty recent day may simply not be posted yet (the FTC runs days behind)
 API = "https://api.ftc.gov/v0/dnc-complaints"
 USER_AGENT = "CallSieve-spamlist/1.0 (+https://github.com/igtox9/callsieve-spamlist)"
 
