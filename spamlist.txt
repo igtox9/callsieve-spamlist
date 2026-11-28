@@ -1,6 +1,6 @@
 # CallSieve known-spam list, format 2: number,distinct_reports and prefix*,distinct_numbers
 # Source: FTC Do Not Call Reported Calls Data (public, unverified reports)
-# generated=2026-11-27 window_days=3 days_used=3 min_reports=3 numbers=219 prefixes=72
+# generated=2026-11-28 window_days=3 days_used=3 min_reports=3 numbers=219 prefixes=72
 8337661884,123
 2178637204,90
 8667715988,54
